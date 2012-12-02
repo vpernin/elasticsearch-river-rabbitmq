@@ -21,7 +21,7 @@ In order to install the plugin, simply run: `bin/plugin -install elasticsearch/e
     | 1.0.0           | 0.18             | 2.7.0           |
     --------------------------------------------------------
 
-RabbitMQ River allows to automatically index a [RabbitMQ](http://www.rabbitmq.com/) queue. The format of the messages follows the bulk api format:
+RabbitMQ River allows to automatically index a [RabbitMQ](http://www.rabbitmq.com/) queue and percolate request. The format of the messages follows the bulk api format:
 
 	{ "index" : { "_index" : "twitter", "_type" : "tweet", "_id" : "1" } }
 	{ "tweet" : { "text" : "this is a tweet" } }
@@ -47,12 +47,21 @@ Creating the rabbitmq river is as simple as (all configuration parameters are pr
 	        "queue_durable" : true,
 	        "queue_auto_delete" : false
 	    },
+	    "percolate" : {
+	        "enabled" : true,
+	        "query" : "*",
+	        "index" : "percolate_match",
+	        "type" : "percolate"
+	    },
 	    "index" : {
 	        "bulk_size" : 100,
 	        "bulk_timeout" : "10ms",
 	        "ordered" : false
 	    }
 	}'
+
+If the percolate enabled parameter is true and the bulk actions do not contain a percolate value, it will be added and set with the query parameter.
+The percolate match will be added to the index with index and type parameters.
 
 Addresses(host-port pairs) also available. it is useful to taking advantage rabbitmq HA(active/active) without any rabbitmq load balancer.
 (http://www.rabbitmq.com/ha.html)
