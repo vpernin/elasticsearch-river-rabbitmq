@@ -23,7 +23,9 @@ import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
+import junit.framework.Assert;
 import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.common.joda.time.format.ISODateTimeFormat;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.node.Node;
 import org.elasticsearch.node.NodeBuilder;
@@ -114,6 +116,8 @@ public class RabbitMQRiverTest {
         String percolateMessageWrongQuery = "{ \"index\" : { \"_index\" : \"test\", \"_type\" : \"type1\", \"_id\" : \"5\", \"_percolate\" : \"doesNotExist\" }\n" +
                 "{ \"type1\" : { \"field1\" : \"value1\" } }\n";
 
+        long publishDate = System.currentTimeMillis();
+
         ch.basicPublish("elasticsearch", "elasticsearch", null, message.getBytes());
         ch.basicPublish("elasticsearch", "elasticsearch", null, percolateMessageOneMatch.getBytes());
         ch.basicPublish("elasticsearch", "elasticsearch", null, percolatedMessageTwoMatches.getBytes());
@@ -131,18 +135,20 @@ public class RabbitMQRiverTest {
                 .execute().actionGet();
 
         assertThat(searchResponse.hits().hits().length, equalTo(3));
-        assertPercolateMatch(searchResponse.hits().getAt(0), "test", "type1", "1", Arrays.asList("percolator1"));
-        assertPercolateMatch(searchResponse.hits().getAt(1), "test", "type1", "3", Arrays.asList("percolator1"));
-        assertPercolateMatch(searchResponse.hits().getAt(2), "test", "type1", "4", Arrays.asList("percolator1", "percolator2"));
+        assertPercolateMatch(searchResponse.hits().getAt(0), "test", "type1", "1", Arrays.asList("percolator1"), publishDate);
+        assertPercolateMatch(searchResponse.hits().getAt(1), "test", "type1", "3", Arrays.asList("percolator1"), publishDate);
+        assertPercolateMatch(searchResponse.hits().getAt(2), "test", "type1", "4", Arrays.asList("percolator1", "percolator2"), publishDate);
 
         System.out.println("Everything is ok");
     }
 
-    private static void assertPercolateMatch(SearchHit hit, String percolateIndex, String percolateType, String id, List<String> matches) {
+    private static void assertPercolateMatch(SearchHit hit, String percolateIndex,
+                                             String percolateType, String id, List<String> matches, long publishDate) {
         assertThat(hit.type(), equalTo("percolate"));
         assertThat(hit.getSource().get("percolate_index").toString(), equalTo(percolateIndex));
         assertThat(hit.getSource().get("percolate_type").toString(), equalTo(percolateType));
         assertThat(hit.getSource().get("percolate_id").toString(), equalTo(id));
+        Assert.assertTrue(ISODateTimeFormat.dateTime().parseDateTime(hit.getSource().get("percolate_date").toString()).isAfter(publishDate));
         assertThat(hit.getSource().get("percolate_match").toString(), equalTo(matches.toString()));
     }
 }

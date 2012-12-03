@@ -30,6 +30,7 @@ import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.common.collect.Lists;
 import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.joda.time.format.ISODateTimeFormat;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.xcontent.XContentFactory;
@@ -402,6 +403,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
             }
 
             BulkRequestBuilder matchRequests = client.prepareBulk();
+            String percolateDate = ISODateTimeFormat.dateTime().print(System.currentTimeMillis());
 
             for (BulkItemResponse item : response.items()) {
                 if (item.response() instanceof IndexResponse) {
@@ -425,6 +427,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                                         .field("percolate_index", indexResponse.getIndex())
                                         .field("percolate_type", indexResponse.getType())
                                         .field("percolate_id", indexResponse.getId())
+                                        .field("percolate_date", percolateDate)
                                         .field("percolate_match", matches)
                                         .endObject()
                                 )
