@@ -8,7 +8,7 @@ In order to install the plugin, simply run: `bin/plugin -install elasticsearch/e
     --------------------------------------------------------
     | RabbitMQ Plugin | ElasticSearch    | RabbitMQ Client |
     --------------------------------------------------------
-    | master          | 0.19 -> master   | 2.8.7           |
+    | master          | 0.20.1 -> master | 2.8.7           |
     --------------------------------------------------------
     | 1.4.0           | 0.19 -> master   | 2.8.4           |
     --------------------------------------------------------
@@ -48,10 +48,11 @@ Creating the rabbitmq river is as simple as (all configuration parameters are pr
 	        "queue_auto_delete" : false
 	    },
 	    "percolate" : {
-	        "enabled" : true,
-	        "query" : "*",
-	        "index" : "percolate_match",
-	        "type" : "percolate"
+	        "percolate_mode" : "INDEX_THEN_PERCOLATE | ON_THE_FLY",
+	        "percolate_query" : "*",
+	        "percolate_index" : "percolate_index",
+	        "percolate_match_index" : "percolate_match"
+	        "percolate_match_type" : "percolate"
 	    },
 	    "index" : {
 	        "bulk_size" : 100,
@@ -60,8 +61,9 @@ Creating the rabbitmq river is as simple as (all configuration parameters are pr
 	    }
 	}'
 
-If the percolate enabled parameter is true and the bulk actions do not contain a percolate value, it will be added and set with the query parameter.
-The percolate match will be added to the index with index and type parameters.
+If the percolate_mode parameter is set to ON_THE_FLY and the bulk actions do not contain a percolate value, percolate on percolateQuery will be added to each bulk request.
+If the percolate_mode parameter is set to INDEX_THEN_PERCOLATE, each bulk request will be percolated against the index percolate_index.
+In both cases, the percolate matches will be added to the index with percolate_match_type and percolate_match_type parameters.
 
 Addresses(host-port pairs) also available. it is useful to taking advantage rabbitmq HA(active/active) without any rabbitmq load balancer.
 (http://www.rabbitmq.com/ha.html)

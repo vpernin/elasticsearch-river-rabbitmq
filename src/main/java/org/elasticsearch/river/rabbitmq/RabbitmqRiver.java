@@ -27,12 +27,14 @@ import org.elasticsearch.action.bulk.BulkRequestBuilder;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
+import org.elasticsearch.action.percolate.PercolateResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.common.collect.Lists;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.joda.time.format.ISODateTimeFormat;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.river.AbstractRiverComponent;
@@ -76,10 +78,51 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
     private volatile ConnectionFactory connectionFactory;
 
-    private String percolateMatchIndex;
-    private String percolateMatchType;
+    protected enum PercolateMode {
+        /**
+         * No percolation
+         */
+        DISABLED,
+
+        /**
+         * Add _percolate to each index action in the bulk request and index the percolator match results
+         */
+        ON_THE_FLY,
+
+        /**
+         * Percolate against an alias is not possible, so index the bulk request,
+         * then percolate each index action against a specific index, then index the percolator match results
+         */
+        INDEX_THEN_PERCOLATE
+    }
+
+    /**
+     * The percolate mode choosen, DISABLED by default
+     */
+    private PercolateMode percolateMode;
+
+    /**
+     * Percolate value used with <code>PercolateMode.ON_THE_FLY</code>
+     * if the bulk index request does not contain percolate parameter,
+     * Defaults to *
+     */
     private String percolateQuery;
-    private boolean percolateEnabled;
+
+    /**
+     * The index to percolate against with <code>PercolateMode.INDEX_THEN_PERCOLATE</code>
+     */
+    private String percolateIndex;
+
+    /**
+     * The percolator match results will be stored in this index
+     */
+    private String percolateMatchIndex;
+
+    /**
+     * The percolator match results will be stored under this type
+     */
+    private String percolateMatchType;
+
 
     @SuppressWarnings({"unchecked"})
     @Inject
@@ -150,10 +193,23 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
         if (settings.settings().containsKey("percolate")) {
             Map<String, Object> percolateSettings = (Map<String, Object>) settings.settings().get("percolate");
-            percolateEnabled = XContentMapValues.nodeBooleanValue(percolateSettings.get("enabled"), false);
-            percolateQuery = XContentMapValues.nodeStringValue(percolateSettings.get("query"), "*");
-            percolateMatchIndex = XContentMapValues.nodeStringValue(percolateSettings.get("index"), "percolate_match");
-            percolateMatchType = XContentMapValues.nodeStringValue(percolateSettings.get("type"), "percolate");
+            if (percolateSettings.containsKey("percolate_mode")) {
+                String percolateModeValue = XContentMapValues.nodeStringValue(percolateSettings.get("percolate_mode"), PercolateMode.DISABLED.name());
+                percolateMode = PercolateMode.valueOf(percolateModeValue);
+
+                // We do not have access to the index request from the bulk index response when using asynchronous execution,
+                //  so the only possible mode is to use ON_THE_FLY mode
+                if (percolateMode.equals(PercolateMode.INDEX_THEN_PERCOLATE) && !ordered) {
+                    logger.error("Percolate mode INDEX_THEN_PERCOLATE is not possible with non ordered, switching to ON_THE_FLY mode");
+                    percolateMode = PercolateMode.ON_THE_FLY;
+                }
+            }
+            percolateQuery = XContentMapValues.nodeStringValue(percolateSettings.get("percolate_query"), "*");
+            percolateIndex = XContentMapValues.nodeStringValue(percolateSettings.get("percolate_index"), "percolate_index");
+            percolateMatchIndex = XContentMapValues.nodeStringValue(percolateSettings.get("percolate_match_index"), "percolate_match");
+            percolateMatchType = XContentMapValues.nodeStringValue(percolateSettings.get("percolate_match_type"), "percolate");
+        } else {
+            percolateMode = PercolateMode.DISABLED;
         }
     }
 
@@ -164,7 +220,9 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
         connectionFactory.setPassword(rabbitPassword);
         connectionFactory.setVirtualHost(rabbitVhost);
 
-        logger.info("creating rabbitmq river, addresses [{}], user [{}], vhost [{}], percolateEnabled [{}]", rabbitAddresses, connectionFactory.getUsername(), connectionFactory.getVirtualHost(), percolateEnabled);
+        logger.info("creating rabbitmq river, addresses [{}], user [{}], vhost [{}]", rabbitAddresses, connectionFactory.getUsername(), connectionFactory.getVirtualHost());
+        logger.info("rabbitmq river percolator, mode [{}], query [{}], percolate index [{}], match index [{}], match type [{}]",
+                percolateMode, percolateQuery, percolateIndex, percolateMatchIndex, percolateMatchType);
 
         thread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "rabbitmq_river").newThread(new Consumer());
         thread.start();
@@ -192,6 +250,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                 if (closed) {
                     break;
                 }
+
                 try {
                     connection = connectionFactory.newConnection(rabbitAddresses);
                     channel = connection.createChannel();
@@ -285,8 +344,10 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                             }
                         }
 
-                        // Add percolate if required
-                        percolateRequests(bulkRequestBuilder);
+                        // Add percolate on the fly if required
+                        if (percolateMode.equals(PercolateMode.ON_THE_FLY)) {
+                            percolateRequestsOnTheFly(bulkRequestBuilder);
+                        }
 
                         if (logger.isTraceEnabled()) {
                             logger.trace("executing bulk with [{}] actions", bulkRequestBuilder.numberOfActions());
@@ -312,12 +373,16 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                                 logger.warn("failed to execute bulk", e);
                             }
 
-                            // Index percolator match
                             try {
-                                handlePercolateMatch(response);
+                                if (percolateMode.equals(PercolateMode.ON_THE_FLY)) {
+                                    handlePercolateMatch(response);
+                                } else if (percolateMode.equals(PercolateMode.INDEX_THEN_PERCOLATE)) {
+                                    percolateResponses(bulkRequestBuilder, response);
+                                }
                             } catch (Exception e) {
-                                logger.warn("failed to index percolate match", e);
+                                logger.warn("failed to percolate", e);
                             }
+
 
                         } else {
                             bulkRequestBuilder.execute(new ActionListener<BulkResponse>() {
@@ -335,11 +400,12 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                                         }
                                     }
 
-                                    // Index percolator match
-                                    try {
-                                        handlePercolateMatch(response);
-                                    } catch (Exception e) {
-                                        logger.warn("failed to index percolate match", e);
+                                    if (percolateMode.equals(PercolateMode.ON_THE_FLY)) {
+                                        try {
+                                            handlePercolateMatch(response);
+                                        } catch (Exception e) {
+                                            logger.warn("failed to index percolate match", e);
+                                        }
                                     }
                                 }
 
@@ -369,72 +435,57 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
         }
 
         /**
-         * For each request in the bulk request, if percolation is not detected and <code>percolateEnabled</code> is True,
-         * add percolate parameter to the request with <code>percolateQuery</code>
+         * If percolate on the fly is enabled, for each index action in the bulk request,<br/>
+         * if percolation is not detected, add percolate parameter to the request with <code>percolateQuery</code>
+         *
          * @param bulkRequestBuilder the bulk request just built ready to be indexed
          */
-        private void percolateRequests(BulkRequestBuilder bulkRequestBuilder) {
-            if (percolateEnabled) {
+        private void percolateRequestsOnTheFly(BulkRequestBuilder bulkRequestBuilder) {
+            for (ActionRequest actionRequest : bulkRequestBuilder.request().requests()) {
+                if (actionRequest instanceof IndexRequest) {
 
-                for (ActionRequest actionRequest : bulkRequestBuilder.request().requests()) {
-                    if (actionRequest instanceof IndexRequest) {
-
-                        IndexRequest indexRequest = (IndexRequest) actionRequest;
-                        if (indexRequest.percolate() == null) {
-                            if (logger.isDebugEnabled()) {
-                                logger.debug("Adding percolate to bulk request [{}]", indexRequest);
-                            }
-                            indexRequest.percolate(percolateQuery);
+                    IndexRequest indexRequest = (IndexRequest) actionRequest;
+                    if (indexRequest.percolate() == null) {
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("Adding percolate to bulk request [{}]", indexRequest);
                         }
+                        indexRequest.percolate(percolateQuery);
                     }
                 }
             }
         }
 
         /**
-         * If <code>percolateEnabled</code>, for each response in the bulk response
-         * that match a percolator query, index the match as specified by
-         * <code>percolateMatchIndex</code>, <code>percolateMatchType</code>
-         * @param response the bulk response that may contains percolator matched
+         * If index then percolate mode is enabled, percolate each request in the bulkRequestBuilder parameter <br />
+         * against <code>percolatorIndex</code> and returns the response.
+         *
+         * @param bulkRequestBuilder the builder containing the request to iterate over to percolate each element
+         * @param bulkRequestResponse the bulk response
          */
-        private void handlePercolateMatch(BulkResponse response) {
-            if (!percolateEnabled) {
-                return;
-            }
-
+        private void percolateResponses(BulkRequestBuilder bulkRequestBuilder, BulkResponse bulkRequestResponse) throws IOException {
             BulkRequestBuilder matchRequests = client.prepareBulk();
             String percolateDate = ISODateTimeFormat.dateTime().print(System.currentTimeMillis());
 
-            for (BulkItemResponse item : response.items()) {
-                if (item.response() instanceof IndexResponse) {
-                    IndexResponse indexResponse = (IndexResponse) item.response();
+            List<ActionRequest> requests = bulkRequestBuilder.request().requests();
+            for (int i = 0 ; i < requests.size() ; i++) {
+                ActionRequest actionRequest = requests.get(i);
+                if (actionRequest instanceof IndexRequest) {
 
-                    List<String> matches = indexResponse.getMatches();
-                    if (matches.isEmpty()) {
-                        continue;
-                    }
+                    IndexRequest indexRequest = (IndexRequest) actionRequest;
 
-                    try {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("Adding percolate match [index={},type={},id={},query={}]",
-                                    indexResponse.getIndex(), indexResponse.getType(),
-                                    indexResponse.getId(), indexResponse.getMatches());
-                        }
+                    XContentBuilder docBuilder = XContentFactory.jsonBuilder()
+                            .startObject()
+                                .field("dummy_field", "dummy_value")
+                                .rawField("doc", indexRequest.source().toBytes())
+                            .endObject();
 
-                        matchRequests.add(client.prepareIndex(percolateMatchIndex, percolateMatchType)
-                                .setSource(XContentFactory.jsonBuilder()
-                                        .startObject()
-                                        .field("percolate_index", indexResponse.getIndex())
-                                        .field("percolate_type", indexResponse.getType())
-                                        .field("percolate_id", indexResponse.getId())
-                                        .field("percolate_date", percolateDate)
-                                        .field("percolate_match", matches)
-                                        .endObject()
-                                )
-                        );
-                    } catch (IOException e) {
-                        logger.error("Failures while building percolate match " + e.getMessage(), e);
-                    }
+                    PercolateResponse percolateResponse = client.preparePercolate(percolateIndex, indexRequest.type())
+                            .setSource(docBuilder)
+                            .execute().actionGet();
+                    BulkItemResponse bulkItemResponse = bulkRequestResponse.items()[i];
+
+                    indexPercolatorMatch(matchRequests, indexRequest.index(), indexRequest.type(),
+                            bulkItemResponse.id(), percolateDate, percolateResponse.matches());
                 }
             }
 
@@ -444,6 +495,62 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                 if (bulkResponse.hasFailures()) {
                     logger.error("Failures while adding log alert " + bulkResponse.buildFailureMessage());
                 }
+            }
+        }
+
+        /**
+         * If percolate on the fly is enabled, for each response in the bulk response that match a percolator query,<br/>
+         * index the match as specified by <code>percolateMatchIndex</code>, <code>percolateMatchType</code>
+         *
+         * @param bulkRequestResponse the bulk response that may contains percolator matched
+         */
+        private void handlePercolateMatch(BulkResponse bulkRequestResponse) {
+            BulkRequestBuilder matchRequests = client.prepareBulk();
+            String percolateDate = ISODateTimeFormat.dateTime().print(System.currentTimeMillis());
+
+            for (BulkItemResponse response : bulkRequestResponse.items()) {
+                if (response.response() instanceof IndexResponse) {
+                    IndexResponse indexResponse = (IndexResponse) response.response();
+
+                    indexPercolatorMatch(matchRequests, indexResponse.getIndex(), indexResponse.getType(),
+                            indexResponse.getId(), percolateDate, indexResponse.getMatches());
+                }
+            }
+
+            if (matchRequests.numberOfActions() > 0) {
+
+                BulkResponse bulkResponse = matchRequests.execute().actionGet();
+                if (bulkResponse.hasFailures()) {
+                    logger.error("Failures while adding log alert " + bulkResponse.buildFailureMessage());
+                }
+            }
+        }
+
+        private void indexPercolatorMatch(BulkRequestBuilder matchRequests, String index, String type, String id, String percolateDate, List<String> matches) {
+            if (matches == null || matches.isEmpty()) {
+                return;
+            }
+
+            try {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Adding to [index={},type={}] percolate match [index={},type={},id={},query={}]",
+                            percolateMatchIndex, percolateMatchType,
+                            index, type, id, matches);
+                }
+
+                matchRequests.add(client.prepareIndex(percolateMatchIndex, percolateMatchType)
+                        .setSource(XContentFactory.jsonBuilder()
+                                .startObject()
+                                .field("percolate_index", index)
+                                .field("percolate_type", type)
+                                .field("percolate_id", id)
+                                .field("percolate_date", percolateDate)
+                                .field("percolate_match", matches)
+                                .endObject()
+                        )
+                );
+            } catch (IOException e) {
+                logger.error("Failures while building percolate match " + e.getMessage(), e);
             }
         }
     }
