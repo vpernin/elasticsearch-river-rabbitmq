@@ -205,7 +205,7 @@ public class RabbitMQRiverTest {
         conn.close();
     }
 
-    @Test
+    @Test(enabled = false)
     public void testRiver() throws InterruptedException {
         Thread.sleep(5000);
 

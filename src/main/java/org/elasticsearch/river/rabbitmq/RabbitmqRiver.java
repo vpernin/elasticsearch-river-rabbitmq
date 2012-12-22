@@ -473,6 +473,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
                     IndexRequest indexRequest = (IndexRequest) actionRequest;
 
+                    // Need to find a way not to use a dummy field as first json objet to be able to use the raw indexRequest source
                     XContentBuilder docBuilder = XContentFactory.jsonBuilder()
                             .startObject()
                                 .field("dummy_field", "dummy_value")
@@ -500,7 +501,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
         /**
          * If percolate on the fly is enabled, for each response in the bulk response that match a percolator query,<br/>
-         * index the match as specified by <code>percolateMatchIndex</code>, <code>percolateMatchType</code>
+         * index the match as specified by <code>percolateMatchIndex</code>, <code>percolateMatchType</code> parameters
          *
          * @param bulkRequestResponse the bulk response that may contains percolator matched
          */
